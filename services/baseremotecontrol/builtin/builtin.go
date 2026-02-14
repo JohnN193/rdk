@@ -30,9 +30,10 @@ const (
 	buttonControl
 	arrowControl
 	droneControl
+	funBaseControl
 )
 
-var modes = []string{"joystickControl", "triggerSpeedControl", "buttonControl", "arrowControl", "droneControl"}
+var modes = []string{"joystickControl", "triggerSpeedControl", "buttonControl", "arrowControl", "droneControl", "funBaseControl"}
 
 func init() {
 	resource.RegisterService(baseremotecontrol.API, resource.DefaultServiceModel, resource.Registration[baseremotecontrol.Service, *Config]{
@@ -50,6 +51,11 @@ type Config struct {
 	ControlModeName     string  `json:"control_mode,omitempty"`
 	MaxAngularVelocity  float64 `json:"max_angular_deg_per_sec,omitempty"`
 	MaxLinearVelocity   float64 `json:"max_linear_mm_per_sec,omitempty"`
+}
+
+type FunCommand struct {
+	Command string
+	Button  string
 }
 
 // Validate creates the list of implicit dependencies.
@@ -153,6 +159,8 @@ func (svc *builtIn) Reconfigure(
 		controlMode1 = joyStickControl
 	case "droneControl":
 		controlMode1 = droneControl
+	case "funBaseControl":
+		controlMode1 = funBaseControl
 	default:
 		controlMode1 = arrowControl
 	}
@@ -299,6 +307,8 @@ func (svc *builtIn) ControllerInputs() []input.Control {
 		return []input.Control{input.AbsoluteX, input.AbsoluteY}
 	case droneControl:
 		return []input.Control{input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY}
+	case funBaseControl:
+		return []input.Control{input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY}
 	}
 	return []input.Control{}
 }
@@ -400,6 +410,21 @@ func (svc *builtIn) processEvent(ctx context.Context, state *throttleState, even
 		newLinear.Y, newAngular.Z = oneJoyStickEvent(event, state.linearThrottle.Y, state.angularThrottle.Z)
 	case droneControl:
 		newLinear, newAngular = droneEvent(event, state.linearThrottle, state.angularThrottle)
+	case funBaseControl:
+		switch event.Control {
+		case input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY:
+			newLinear, newAngular = funBaseEvent(event, state.linearThrottle, state.angularThrottle)
+		case input.AbsoluteHat0X, input.AbsoluteHat0Y, input.AbsoluteRZ, input.AbsoluteZ, input.ButtonEStop,
+			input.ButtonEast, input.ButtonLT, input.ButtonLT2, input.ButtonLThumb, input.ButtonMenu, input.ButtonNorth,
+			input.ButtonRT, input.ButtonRT2, input.ButtonRThumb, input.ButtonRecord, input.ButtonSelect,
+			input.ButtonSouth, input.ButtonStart, input.ButtonWest, input.AbsolutePedalAccelerator,
+			input.AbsolutePedalBrake, input.AbsolutePedalClutch:
+			fallthrough
+		default:
+			newLinear = oldLinear
+			newAngular = oldAngular
+		}
+
 	case triggerSpeedControl:
 		newLinear.Y, newAngular.Z = triggerSpeedEvent(event, state.linearThrottle.Y, state.angularThrottle.Z)
 	case buttonControl:
@@ -531,6 +556,30 @@ func droneEvent(event input.Event, linear, angular r3.Vector) (r3.Vector, r3.Vec
 		linear.X = scaleThrottle(event.Value)
 	case input.AbsoluteRY:
 		linear.Y = scaleThrottle(-1.0 * event.Value)
+	case input.AbsoluteHat0X, input.AbsoluteHat0Y, input.AbsoluteRZ, input.AbsoluteZ, input.ButtonEStop,
+		input.ButtonEast, input.ButtonLT, input.ButtonLT2, input.ButtonLThumb, input.ButtonMenu, input.ButtonNorth,
+		input.ButtonRT, input.ButtonRT2, input.ButtonRThumb, input.ButtonRecord, input.ButtonSelect,
+		input.ButtonSouth, input.ButtonStart, input.ButtonWest, input.AbsolutePedalAccelerator,
+		input.AbsolutePedalBrake, input.AbsolutePedalClutch:
+		fallthrough
+	default:
+	}
+
+	return linear, angular
+}
+
+// right joystick is forward/back, strafe right/left
+// left joystick is spin right/left & up/down.
+func funBaseEvent(event input.Event, linear, angular r3.Vector) (r3.Vector, r3.Vector) {
+	switch event.Control {
+	case input.AbsoluteX:
+		linear.X = scaleThrottle(-1.0 * event.Value)
+	case input.AbsoluteY:
+		linear.Y = scaleThrottle(-1.0 * event.Value)
+	case input.AbsoluteRX:
+		angular.Z = scaleThrottle(event.Value)
+	case input.AbsoluteRY:
+		angular.X = scaleThrottle(-1.0 * event.Value)
 	case input.AbsoluteHat0X, input.AbsoluteHat0Y, input.AbsoluteRZ, input.AbsoluteZ, input.ButtonEStop,
 		input.ButtonEast, input.ButtonLT, input.ButtonLT2, input.ButtonLThumb, input.ButtonMenu, input.ButtonNorth,
 		input.ButtonRT, input.ButtonRT2, input.ButtonRThumb, input.ButtonRecord, input.ButtonSelect,
