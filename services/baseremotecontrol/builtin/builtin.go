@@ -4,6 +4,7 @@ package builtin
 import (
 	"context"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,16 +47,18 @@ type controlMode uint8
 
 // Config describes how to configure the service.
 type Config struct {
-	BaseName            string  `json:"base"`
-	InputControllerName string  `json:"input_controller"`
-	ControlModeName     string  `json:"control_mode,omitempty"`
-	MaxAngularVelocity  float64 `json:"max_angular_deg_per_sec,omitempty"`
-	MaxLinearVelocity   float64 `json:"max_linear_mm_per_sec,omitempty"`
+	BaseName            string                `json:"base"`
+	InputControllerName string                `json:"input_controller"`
+	ControlModeName     string                `json:"control_mode,omitempty"`
+	MaxAngularVelocity  float64               `json:"max_angular_deg_per_sec,omitempty"`
+	MaxLinearVelocity   float64               `json:"max_linear_mm_per_sec,omitempty"`
+	FunCommands         map[string]FunCommand `json:"fun_commands,omitempty"`
 }
 
 type FunCommand struct {
-	Command string
-	Button  string
+	Command        string      `json:"cmd,omitempty"`
+	DoCommandInput interface{} `json:"input,omitempty"`
+	EventType      string      `json:"event_type,omitempty"`
 }
 
 // Validate creates the list of implicit dependencies.
@@ -85,6 +88,35 @@ func (conf *Config) Validate(path string) ([]string, []string, error) {
 		}
 	}
 
+	if conf.ControlModeName == "funBaseControl" {
+		validControls := map[input.Control]bool{
+			input.AbsoluteX: false, input.AbsoluteY: false, input.AbsoluteZ: true,
+			input.AbsoluteRX: false, input.AbsoluteRY: false, input.AbsoluteRZ: true,
+			input.AbsoluteHat0X: true, input.AbsoluteHat0Y: true,
+			input.ButtonSouth: true, input.ButtonEast: true, input.ButtonWest: true, input.ButtonNorth: true,
+			input.ButtonLT: true, input.ButtonRT: true, input.ButtonLT2: true, input.ButtonRT2: true,
+			input.ButtonLThumb: true, input.ButtonRThumb: true,
+			input.ButtonSelect: true, input.ButtonStart: true, input.ButtonMenu: true,
+			input.ButtonRecord: true, input.ButtonEStop: true,
+			input.AbsolutePedalAccelerator: true, input.AbsolutePedalBrake: true, input.AbsolutePedalClutch: true,
+		}
+		validEventTypes := map[input.EventType]bool{
+			input.ButtonPress: true, input.ButtonRelease: true,
+			input.ButtonHold: true, input.ButtonChange: true,
+			input.PositionChangeAbs: true, input.PositionChangeRel: true,
+		}
+		for k, fc := range conf.FunCommands {
+			if !validControls[input.Control(k)] {
+				return nil, nil, resource.NewConfigValidationError(path,
+					errors.Errorf("fun_commands key '%s' is not a valid input control", k))
+			}
+			if fc.EventType != "" && !validEventTypes[input.EventType(fc.EventType)] {
+				return nil, nil, resource.NewConfigValidationError(path,
+					errors.Errorf("fun_commands key '%s' has invalid event_type '%s'", k, fc.EventType))
+			}
+		}
+	}
+
 	return deps, nil, nil
 }
 
@@ -104,6 +136,7 @@ type builtIn struct {
 	cancelCtx               context.Context
 	activeBackgroundWorkers sync.WaitGroup
 	events                  chan (struct{})
+	funCmdQueue             chan map[string]interface{}
 	instance                atomic.Int64
 }
 
@@ -116,11 +149,12 @@ func NewBuiltIn(
 ) (baseremotecontrol.Service, error) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	remoteSvc := &builtIn{
-		Named:     conf.ResourceName().AsNamed(),
-		logger:    logger,
-		cancelCtx: cancelCtx,
-		cancel:    cancel,
-		events:    make(chan struct{}, 1),
+		Named:       conf.ResourceName().AsNamed(),
+		logger:      logger,
+		cancelCtx:   cancelCtx,
+		cancel:      cancel,
+		events:      make(chan struct{}, 1),
+		funCmdQueue: make(chan map[string]interface{}, 1),
 	}
 	remoteSvc.state.init()
 	if err := remoteSvc.Reconfigure(ctx, deps, conf); err != nil {
@@ -249,22 +283,17 @@ func (svc *builtIn) registerCallbacks(ctx context.Context, state *throttleState)
 			svc.mu.RLock()
 			defer svc.mu.RUnlock()
 			var err error
-			if svc.controlMode == buttonControl {
-				err = svc.inputController.RegisterControlCallback(
-					ctx,
-					control,
-					[]input.EventType{input.ButtonChange},
-					remoteCtl,
-					map[string]interface{}{},
-				)
-			} else {
-				err = svc.inputController.RegisterControlCallback(ctx,
-					control,
-					[]input.EventType{input.PositionChangeAbs},
-					remoteCtl,
-					map[string]interface{}{},
-				)
+			eventTypes := []input.EventType{input.PositionChangeAbs}
+			if svc.controlMode == buttonControl || strings.HasPrefix(string(control), "Button") {
+				eventTypes = []input.EventType{input.ButtonChange}
 			}
+			err = svc.inputController.RegisterControlCallback(
+				ctx,
+				control,
+				eventTypes,
+				remoteCtl,
+				map[string]interface{}{},
+			)
 			if err != nil {
 				return err
 			}
@@ -308,7 +337,11 @@ func (svc *builtIn) ControllerInputs() []input.Control {
 	case droneControl:
 		return []input.Control{input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY}
 	case funBaseControl:
-		return []input.Control{input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY}
+		controls := []input.Control{input.AbsoluteX, input.AbsoluteY, input.AbsoluteRX, input.AbsoluteRY}
+		for k := range svc.config.FunCommands {
+			controls = append(controls, input.Control(k))
+		}
+		return controls
 	}
 	return []input.Control{}
 }
@@ -388,6 +421,17 @@ func (svc *builtIn) eventProcessor() {
 			}() {
 				return
 			}
+
+			select {
+			case cmd := <-svc.funCmdQueue:
+				svc.logger.Infow("executing fun command from queue", "cmd", cmd)
+				svc.mu.RLock()
+				if _, err := svc.base.DoCommand(svc.cancelCtx, cmd); err != nil {
+					svc.logger.Errorw("error executing fun command", "error", err)
+				}
+				svc.mu.RUnlock()
+			default:
+			}
 		}
 	}, svc.activeBackgroundWorkers.Done)
 }
@@ -419,6 +463,26 @@ func (svc *builtIn) processEvent(ctx context.Context, state *throttleState, even
 			input.ButtonRT, input.ButtonRT2, input.ButtonRThumb, input.ButtonRecord, input.ButtonSelect,
 			input.ButtonSouth, input.ButtonStart, input.ButtonWest, input.AbsolutePedalAccelerator,
 			input.AbsolutePedalBrake, input.AbsolutePedalClutch:
+			svc.logger.Infow("fun control event", "control", event.Control, "value", event.Value)
+			if funCmd, ok := svc.config.FunCommands[string(event.Control)]; ok {
+				expectedEventType := input.EventType(funCmd.EventType)
+				if expectedEventType == "" {
+					expectedEventType = input.ButtonPress
+				}
+				if event.Event != expectedEventType {
+					svc.logger.Debugw("fun command event type mismatch", "control", event.Control, "expected", expectedEventType, "got", event.Event)
+				} else {
+					svc.logger.Infow("enqueueing fun command", "cmd", funCmd.Command, "input", funCmd.DoCommandInput)
+					select {
+					case svc.funCmdQueue <- map[string]interface{}{funCmd.Command: funCmd.DoCommandInput}:
+						svc.logger.Infow("fun command enqueued")
+					default:
+						svc.logger.Warnw("fun command queue full, dropping command")
+					}
+				}
+			} else {
+				svc.logger.Debugw("no fun command configured for control", "control", event.Control)
+			}
 			fallthrough
 		default:
 			newLinear = oldLinear
@@ -436,9 +500,11 @@ func (svc *builtIn) processEvent(ctx context.Context, state *throttleState, even
 	state.angularThrottle = newAngular
 	state.mu.Unlock()
 
-	if similar(newLinear, oldLinear, .05) && similar(newAngular, oldAngular, .05) {
+	if similar(newLinear, oldLinear, .05) && similar(newAngular, oldAngular, .05) && len(svc.funCmdQueue) == 0 {
+		svc.logger.Debugw("skipping event signal, no changes", "control", event.Control)
 		return
 	}
+	svc.logger.Debugw("signaling event processor", "control", event.Control, "funCmdQueueLen", len(svc.funCmdQueue))
 
 	// If we do not manage to send the event, that means the processor
 	// is working and it is about to see our state change anyway. This
@@ -577,7 +643,7 @@ func funBaseEvent(event input.Event, linear, angular r3.Vector) (r3.Vector, r3.V
 	case input.AbsoluteY:
 		linear.Y = scaleThrottle(-1.0 * event.Value)
 	case input.AbsoluteRX:
-		angular.Z = scaleThrottle(event.Value)
+		angular.Z = scaleThrottle(-1.0 * event.Value)
 	case input.AbsoluteRY:
 		angular.X = scaleThrottle(-1.0 * event.Value)
 	case input.AbsoluteHat0X, input.AbsoluteHat0Y, input.AbsoluteRZ, input.AbsoluteZ, input.ButtonEStop,
