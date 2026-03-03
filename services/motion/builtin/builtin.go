@@ -31,6 +31,7 @@ import (
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/framesystem"
+	"go.viam.com/rdk/services/mlmodel"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/services/slam"
 	"go.viam.com/rdk/services/vision"
@@ -80,6 +81,24 @@ type inputEnabledActuator interface {
 	framesystem.InputEnabled
 }
 
+// trajGenFromConfig converts an armplanning.TrajGenConfig to an armplanning.TrajGen by
+// resolving the named mlmodel service from deps.
+func trajGenFromConfig(conf *armplanning.TrajGenConfig, deps resource.Dependencies) (*armplanning.TrajGen, error) {
+	svc, err := mlmodel.FromProvider(deps, conf.Service)
+	if err != nil {
+		return nil, err
+	}
+	return armplanning.NewTrajGen(
+		svc,
+		conf.PathToleranceDeltaRads,
+		conf.PathColinearizationRatio,
+		conf.WaypointDeduplicationToleranceRads,
+		conf.VelocityLimitsRadsPerSec,
+		conf.AccelerationLimitsRadsPerSec2,
+		conf.SamplingFreqHz,
+	), nil
+}
+
 // Config describes how to configure the service; currently only used for specifying dependency on framesystem service.
 type Config struct {
 	LogFilePath string `json:"log_file_path"`
@@ -92,6 +111,8 @@ type Config struct {
 
 	// example { "arm" : { "3" : { "min" : 0, "max" : 2 } } }
 	InputRangeOverride map[string]map[string]referenceframe.Limit `json:"input_range_override"`
+
+	TrajGen *armplanning.TrajGenConfig `json:"trajectory_generator,omitempty"`
 }
 
 func (c *Config) shouldWritePlan(start time.Time, err error) bool {
@@ -109,6 +130,7 @@ func (c *Config) shouldWritePlan(start time.Time, err error) bool {
 
 // Validate here adds a dependency on the internal framesystem service.
 func (c *Config) Validate(path string) ([]string, []string, error) {
+	deps := []string{framesystem.InternalServiceName.String()}
 	if c.NumThreads < 0 {
 		return nil, nil, fmt.Errorf("cannot configure with %d number of threads, number must be positive", c.NumThreads)
 	}
@@ -120,8 +142,15 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.LogSlowPlanThresholdMS != 0 && c.PlanFilePath == "" {
 		return nil, nil, fmt.Errorf("need a plan_file_path if you sent LogSlowPlanThresholdMS to %v", c.LogSlowPlanThresholdMS)
 	}
+	if c.TrajGen != nil {
+		trajGenDeps, err := c.TrajGen.Validate(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		deps = append(deps, trajGenDeps...)
+	}
 
-	return []string{framesystem.InternalServiceName.String()}, nil, nil
+	return deps, nil, nil
 }
 
 type builtIn struct {
