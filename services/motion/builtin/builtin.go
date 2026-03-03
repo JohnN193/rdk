@@ -31,7 +31,6 @@ import (
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/robot/framesystem"
-	"go.viam.com/rdk/services/mlmodel"
 	"go.viam.com/rdk/services/motion"
 	"go.viam.com/rdk/services/slam"
 	"go.viam.com/rdk/services/vision"
@@ -79,24 +78,6 @@ const (
 type inputEnabledActuator interface {
 	resource.Actuator
 	framesystem.InputEnabled
-}
-
-// trajGenFromConfig converts an armplanning.TrajGenConfig to an armplanning.TrajGen by
-// resolving the named mlmodel service from deps.
-func trajGenFromConfig(conf *armplanning.TrajGenConfig, deps resource.Dependencies) (*armplanning.TrajGen, error) {
-	svc, err := mlmodel.FromProvider(deps, conf.Service)
-	if err != nil {
-		return nil, err
-	}
-	return armplanning.NewTrajGen(
-		svc,
-		conf.PathToleranceDeltaRads,
-		conf.PathColinearizationRatio,
-		conf.WaypointDeduplicationToleranceRads,
-		conf.VelocityLimitsRadsPerSec,
-		conf.AccelerationLimitsRadsPerSec2,
-		conf.SamplingFreqHz,
-	), nil
 }
 
 // Config describes how to configure the service; currently only used for specifying dependency on framesystem service.
@@ -164,6 +145,7 @@ type builtIn struct {
 	components              map[string]resource.Resource
 	logger                  logging.Logger
 	configuredDefaultExtras map[string]any
+	trajGen                 *armplanning.TrajGen
 }
 
 // NewBuiltIn returns a new move and grab service for the given robot.
@@ -227,6 +209,14 @@ func (ms *builtIn) Reconfigure(
 	ms.slamServices = slamServices
 	ms.visionServices = visionServices
 	ms.components = componentMap
+
+	ms.trajGen = nil
+	if config.TrajGen != nil {
+		ms.trajGen, err = config.TrajGen.ToTrajGen(deps)
+		if err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
@@ -510,7 +500,12 @@ func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq, logger logging.
 	}
 
 	start := time.Now()
-	plan, _, err := armplanning.PlanMotion(ctx, logger, planRequest)
+	var plan motionplan.Plan
+	if ms.trajGen != nil {
+		plan, _, err = armplanning.PlanMotionTrajGen(ctx, logger, planRequest, ms.trajGen)
+	} else {
+		plan, _, err = armplanning.PlanMotion(ctx, logger, planRequest)
+	}
 	if ms.conf.shouldWritePlan(start, err) {
 		var traceID string
 		if span := trace.FromContext(ctx); span != nil {

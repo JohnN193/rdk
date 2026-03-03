@@ -41,6 +41,23 @@ func (cfg *TrajGenConfig) Validate(path string) ([]string, error) {
 	return []string{cfg.Service}, nil
 }
 
+// ToTrajGen resolves the named mlmodel service from deps and returns a TrajGen ready for use.
+func (cfg *TrajGenConfig) ToTrajGen(deps resource.Dependencies) (*TrajGen, error) {
+	svc, err := mlmodel.FromProvider(deps, cfg.Service)
+	if err != nil {
+		return nil, err
+	}
+	return NewTrajGen(
+		svc,
+		cfg.PathToleranceDeltaRads,
+		cfg.PathColinearizationRatio,
+		cfg.WaypointDeduplicationToleranceRads,
+		cfg.VelocityLimitsRadsPerSec,
+		cfg.AccelerationLimitsRadsPerSec2,
+		cfg.SamplingFreqHz,
+	), nil
+}
+
 const (
 	defaultTrajGenPathToleranceDeltaRads             = 0.1
 	defaultTrajGenWaypointDeduplicationToleranceRads = 1e-3
@@ -88,16 +105,39 @@ func NewTrajGen(
 	}
 }
 
+// TrajGenPlan is a motionplan.Plan enriched with the kinodynamic data produced by the trajectory
+// generator service. Callers that only need joint configurations can use it as a plain Plan;
+// callers that need velocities, accelerations, or timestamps can type-assert to *TrajGenPlan.
+type TrajGenPlan struct {
+	*motionplan.SimplePlan
+	// Velocities holds per-joint velocities at each trajectory sample, parallel to Trajectory().
+	Velocities []*referenceframe.LinearInputs
+	// Accelerations holds per-joint accelerations at each sample. It is nil when the service did
+	// not return acceleration data.
+	Accelerations []*referenceframe.LinearInputs
+	// SampleTimes holds the time (in seconds) of each sample, parallel to Trajectory().
+	SampleTimes []float64
+}
+
+// trajGenResult is the raw output of inferTrajGen.
+type trajGenResult struct {
+	configurations []*referenceframe.LinearInputs
+	velocities     []*referenceframe.LinearInputs
+	accelerations  []*referenceframe.LinearInputs // nil when not provided by the service
+	sampleTimes    []float64
+}
+
 // inferTrajGen sends the waypoints to the trajectory generator service and returns the resulting
-// densely-sampled trajectory. Returns nil if the service indicates the arm is already at the goal.
+// densely-sampled kinodynamic trajectory. Returns nil when the service indicates the arm is
+// already at the goal (fewer than 2 distinct waypoints after deduplication).
 func inferTrajGen(
 	ctx context.Context,
 	fs *referenceframe.FrameSystem,
 	trajAsInps []*referenceframe.LinearInputs,
 	tg *TrajGen,
-) ([]*referenceframe.LinearInputs, error) {
+) (*trajGenResult, error) {
 	if len(trajAsInps) == 0 {
-		return trajAsInps, nil
+		return &trajGenResult{}, nil
 	}
 
 	schema, err := trajAsInps[0].GetSchema(fs)
@@ -168,16 +208,51 @@ func inferTrajGen(
 		return nil, nil
 	}
 
-	configsData := configsTensor.Data().([]float64)
 	nSamples := configsTensor.Shape()[0]
-	result := make([]*referenceframe.LinearInputs, nSamples)
-	for i := range nSamples {
-		li, err := schema.FloatsToInputs(configsData[i*dof : (i+1)*dof])
+
+	// Helper: convert a flat [n_samples, dof] tensor into []*LinearInputs using the schema.
+	linearize := func(t *tensor.Dense) ([]*referenceframe.LinearInputs, error) {
+		data := t.Data().([]float64)
+		out := make([]*referenceframe.LinearInputs, nSamples)
+		for i := range nSamples {
+			li, err := schema.FloatsToInputs(data[i*dof : (i+1)*dof])
+			if err != nil {
+				return nil, err
+			}
+			out[i] = li
+		}
+		return out, nil
+	}
+
+	configs, err := linearize(configsTensor)
+	if err != nil {
+		return nil, err
+	}
+
+	velsTensor, ok := outMap["velocities_rads_per_sec"]
+	if !ok {
+		return nil, errors.New("trajectory generator service did not return velocities_rads_per_sec")
+	}
+	vels, err := linearize(velsTensor)
+	if err != nil {
+		return nil, err
+	}
+
+	times := outMap["sample_times_sec"].Data().([]float64)
+
+	result := &trajGenResult{
+		configurations: configs,
+		velocities:     vels,
+		sampleTimes:    times,
+	}
+
+	if accelTensor, ok := outMap["accelerations_rads_per_sec2"]; ok {
+		result.accelerations, err = linearize(accelTensor)
 		if err != nil {
 			return nil, err
 		}
-		result[i] = li
 	}
+
 	return result, nil
 }
 
@@ -226,16 +301,31 @@ func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request
 
 	meta.GoalsProcessed = goalsProcessed
 
-	trajAsInps, err = inferTrajGen(ctx, request.FrameSystem, trajAsInps, trajGen)
+	tgResult, err := inferTrajGen(ctx, request.FrameSystem, trajAsInps, trajGen)
 	if err != nil {
 		return nil, meta, err
 	}
-	if trajAsInps == nil {
-		trajAsInps = []*referenceframe.LinearInputs{}
+
+	configs := []*referenceframe.LinearInputs{}
+	if tgResult != nil {
+		configs = tgResult.configurations
 	}
 
-	t, err := motionplan.NewSimplePlanFromTrajectory(trajAsInps, request.FrameSystem)
+	simplePlan, err := motionplan.NewSimplePlanFromTrajectory(configs, request.FrameSystem)
 	if err != nil {
+		return nil, meta, err
+	}
+
+	t := &TrajGenPlan{
+		SimplePlan: simplePlan,
+	}
+	if tgResult != nil {
+		t.Velocities = tgResult.velocities
+		t.Accelerations = tgResult.accelerations
+		t.SampleTimes = tgResult.sampleTimes
+	}
+
+	if err := CheckPlanFromRequest(ctx, logger, request, t); err != nil {
 		return nil, meta, err
 	}
 
