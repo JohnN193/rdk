@@ -28,12 +28,16 @@ type TrajGenConfig struct {
 	SamplingFreqHz                     *float64 `json:"trajectory_sampling_freq_hz,omitempty"`
 }
 
+// Validate returns the mlmodel service name as a required dependency and checks that velocity and
+// acceleration limits are positive.
 func (cfg *TrajGenConfig) Validate(path string) ([]string, error) {
 	if cfg.VelocityLimitsRadsPerSec <= 0 {
-		return nil, fmt.Errorf("need positive velocity_limits_rads_per_sec if using trajectory_generator, got %v", cfg.VelocityLimitsRadsPerSec)
+		return nil, fmt.Errorf("need positive velocity_limits_rads_per_sec if using trajectory_generator, got %v",
+			cfg.VelocityLimitsRadsPerSec)
 	}
 	if cfg.AccelerationLimitsRadsPerSec2 <= 0 {
-		return nil, fmt.Errorf("need positive acceleration_limits_rads_per_sec2 if using trajectory_generator, got %v", cfg.AccelerationLimitsRadsPerSec2)
+		return nil, fmt.Errorf("need positive acceleration_limits_rads_per_sec2 if using trajectory_generator, got %v",
+			cfg.AccelerationLimitsRadsPerSec2)
 	}
 	if cfg.Service == "" {
 		return nil, resource.NewConfigValidationFieldRequiredError(path, "service")
@@ -64,6 +68,14 @@ const (
 	defaultTrajGenSamplingFreqHz                     = 10.0
 	defaultTrajGenPathColinearizationRatio           = 0.0
 )
+
+// DoCommandKeyExecuteTrajGenPlan is the do_command key for sending a precomputed kinodynamic
+// trajectory to an arm component that supports it.
+const DoCommandKeyExecuteTrajGenPlan = "execute_traj_gen_plan"
+
+// DoCommandKeySupportsExecuteTrajGenPlan is the capability probe key. Arms that support
+// execute_traj_gen_plan respond to this with true.
+const DoCommandKeySupportsExecuteTrajGenPlan = "supports_execute_traj_gen_plan"
 
 // TrajGen holds a resolved trajectory generator ML model service along with its configuration.
 type TrajGen struct {
@@ -279,7 +291,9 @@ func inferTrajGen(
 }
 
 // PlanMotionTrajGen plans a motion from a provided plan request using a trajectory generator.
-func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request *PlanRequest, trajGen *TrajGen) (motionplan.Plan, *PlanMeta, error) {
+func PlanMotionTrajGen(
+	ctx context.Context, parentLogger logging.Logger, request *PlanRequest, trajGen *TrajGen,
+) (motionplan.Plan, *PlanMeta, error) {
 	logger := parentLogger.Sublogger("mp")
 
 	start := time.Now()
@@ -290,38 +304,10 @@ func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request
 		span.End()
 	}()
 
-	if err := request.validatePlanRequest(); err != nil {
-		return nil, meta, err
-	}
-	logger.CDebugf(ctx, "constraint specs for this step: %v", request.Constraints)
-	logger.CDebugf(ctx, "motion config for this step: %v", request.PlannerOptions)
-	logger.CDebugf(ctx, "start position: %v", request.StartState.structuredConfiguration)
-
-	if request.PlannerOptions == nil {
-		request.PlannerOptions = NewBasicPlannerOptions()
-	}
-
-	if request.StartState.structuredConfiguration == nil {
-		return nil, meta, errors.New("must populate start state configuration")
-	}
-
-	sfPlanner, err := newPlanManager(ctx, logger, request, meta)
+	trajAsInps, err := planWaypoints(ctx, logger, request, meta)
 	if err != nil {
 		return nil, meta, err
 	}
-
-	trajAsInps, goalsProcessed, err := sfPlanner.planMultiWaypoint(ctx)
-	if err != nil {
-		if request.PlannerOptions.ReturnPartialPlan {
-			meta.Partial = true
-			meta.PartialError = err
-			logger.Infof("returning partial plan, error: %v", err)
-		} else {
-			return nil, meta, err
-		}
-	}
-
-	meta.GoalsProcessed = goalsProcessed
 
 	logger.CInfof(ctx, "sending %d waypoints to traj-gen service", len(trajAsInps))
 	tgResult, err := inferTrajGen(ctx, request.FrameSystem, trajAsInps, trajGen)

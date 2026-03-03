@@ -144,23 +144,40 @@ func CheckPlan(
 // detectMovingFrames returns the set of frame names whose inputs change at any point in the
 // trajectory. If no frames change (e.g. all waypoints are identical) every frame in the
 // trajectory is treated as moving.
+//
+// Runs in a single pass, comparing each step to the previous one.
 func detectMovingFrames(trajectory motionplan.Trajectory) map[string]bool {
 	movingFrames := make(map[string]bool)
-	if len(trajectory) == 0 {
-		return movingFrames
-	}
-
 	framesInTraj := make(map[string]bool)
+
+	var prev referenceframe.FrameSystemInputs
+	first := true
 	for _, step := range trajectory {
 		for name := range step {
 			framesInTraj[name] = true
 		}
-	}
-
-	for name := range framesInTraj {
-		if hasChangingInputs(name, trajectory) {
-			movingFrames[name] = true
+		if first {
+			prev = step
+			first = false
+			continue
 		}
+		for name, inputs := range step {
+			if movingFrames[name] {
+				continue
+			}
+			prevInputs := prev[name]
+			if len(inputs) != len(prevInputs) {
+				movingFrames[name] = true
+				continue
+			}
+			for j := range inputs {
+				if inputs[j] != prevInputs[j] {
+					movingFrames[name] = true
+					break
+				}
+			}
+		}
+		prev = step
 	}
 
 	// Fallback: if nothing moved, treat all frames in the trajectory as moving.
@@ -171,30 +188,6 @@ func detectMovingFrames(trajectory motionplan.Trajectory) map[string]bool {
 	}
 
 	return movingFrames
-}
-
-// hasChangingInputs returns true if the named frame has different input values at any two
-// consecutive steps in the trajectory.
-func hasChangingInputs(frameName string, trajectory motionplan.Trajectory) bool {
-	if len(trajectory) < 2 {
-		return false
-	}
-	first := trajectory[0][frameName]
-	if first == nil {
-		return false
-	}
-	for i := 1; i < len(trajectory); i++ {
-		curr := trajectory[i][frameName]
-		if len(curr) != len(first) {
-			return true
-		}
-		for j := range first {
-			if curr[j] != first[j] {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // belongsToMovingFrame returns true when the geometry label starts with one of the moving frame

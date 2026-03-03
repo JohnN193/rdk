@@ -540,18 +540,18 @@ func (ms *builtIn) execute(ctx context.Context, plan motionplan.Plan, epsilon fl
 		}
 		if armName != "" {
 			if r, ok := ms.components[armName]; ok {
-				const capKey = "supports_execute_traj_gen_plan"
-				capResp, err := r.DoCommand(ctx, map[string]interface{}{capKey: true})
+				capResp, err := r.DoCommand(ctx, map[string]any{armplanning.DoCommandKeySupportsExecuteTrajGenPlan: true})
 				if err == nil {
-					if v, _ := capResp[capKey].(bool); v {
+					if v, _ := capResp[armplanning.DoCommandKeySupportsExecuteTrajGenPlan].(bool); v {
 						ms.logger.CInfof(ctx, "executing traj-gen plan on %q (%d samples)", armName, len(tgp.Configurations))
 						_, err = r.DoCommand(ctx, map[string]any{
-							"execute_traj_gen_plan": tgp.DoCommandPayload(),
+							armplanning.DoCommandKeyExecuteTrajGenPlan: tgp.DoCommandPayload(),
 						})
 						return err
 					}
 				}
-				ms.logger.CInfof(ctx, "arm %q does not support execute_traj_gen_plan, falling back to GoToInputs", armName)
+				ms.logger.CInfof(ctx, "arm %q does not support %s, falling back to GoToInputs",
+					armName, armplanning.DoCommandKeyExecuteTrajGenPlan)
 			}
 		}
 	}

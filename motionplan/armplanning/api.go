@@ -183,19 +183,17 @@ type PlanMeta struct {
 }
 
 // PlanMotion plans a motion from a provided plan request.
-func PlanMotion(ctx context.Context, parentLogger logging.Logger, request *PlanRequest) (motionplan.Plan, *PlanMeta, error) {
-	logger := parentLogger.Sublogger("mp")
-
-	start := time.Now()
-	meta := &PlanMeta{}
-	ctx, span := trace.StartSpan(ctx, "PlanMotion")
-	defer func() {
-		meta.Duration = time.Since(start)
-		span.End()
-	}()
-
+// planWaypoints runs validation, sets up the planner, and executes multi-waypoint planning.
+// It populates meta.GoalsProcessed (and meta.Partial on a partial-plan error).
+// The span/timing setup is left to the caller so that it covers the caller's full lifetime.
+func planWaypoints(
+	ctx context.Context,
+	logger logging.Logger,
+	request *PlanRequest,
+	meta *PlanMeta,
+) ([]*referenceframe.LinearInputs, error) {
 	if err := request.validatePlanRequest(); err != nil {
-		return nil, meta, err
+		return nil, err
 	}
 	logger.CDebugf(ctx, "constraint specs for this step: %v", request.Constraints)
 	logger.CDebugf(ctx, "motion config for this step: %v", request.PlannerOptions)
@@ -209,12 +207,12 @@ func PlanMotion(ctx context.Context, parentLogger logging.Logger, request *PlanR
 	// goal configurations. However, the blocker here is the lack of a "known good" configuration used to determine which obstacles
 	// are allowed to collide with one another.
 	if request.StartState.structuredConfiguration == nil {
-		return nil, meta, errors.New("must populate start state configuration")
+		return nil, errors.New("must populate start state configuration")
 	}
 
 	sfPlanner, err := newPlanManager(ctx, logger, request, meta)
 	if err != nil {
-		return nil, meta, err
+		return nil, err
 	}
 
 	trajAsInps, goalsProcessed, err := sfPlanner.planMultiWaypoint(ctx)
@@ -224,11 +222,30 @@ func PlanMotion(ctx context.Context, parentLogger logging.Logger, request *PlanR
 			meta.PartialError = err
 			logger.Infof("returning partial plan, error: %v", err)
 		} else {
-			return nil, meta, err
+			return nil, err
 		}
 	}
 
 	meta.GoalsProcessed = goalsProcessed
+	return trajAsInps, nil
+}
+
+// PlanMotion plans a motion from a provided plan request.
+func PlanMotion(ctx context.Context, parentLogger logging.Logger, request *PlanRequest) (motionplan.Plan, *PlanMeta, error) {
+	logger := parentLogger.Sublogger("mp")
+
+	start := time.Now()
+	meta := &PlanMeta{}
+	ctx, span := trace.StartSpan(ctx, "PlanMotion")
+	defer func() {
+		meta.Duration = time.Since(start)
+		span.End()
+	}()
+
+	trajAsInps, err := planWaypoints(ctx, logger, request, meta)
+	if err != nil {
+		return nil, meta, err
+	}
 
 	t, err := motionplan.NewSimplePlanFromTrajectory(trajAsInps, request.FrameSystem)
 	if err != nil {
