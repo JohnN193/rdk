@@ -3,6 +3,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -235,7 +236,7 @@ func (ms *builtIn) Move(ctx context.Context, req motion.MoveReq) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	err = ms.execute(ctx, plan.Trajectory(), math.MaxFloat64)
+	err = ms.execute(ctx, plan, math.MaxFloat64)
 	return err == nil, err
 }
 
@@ -368,7 +369,7 @@ func (ms *builtIn) DoCommand(ctx context.Context, cmd map[string]interface{}) (m
 
 			resp[DoExecuteCheckStart] = "resource at starting location"
 		}
-		if err := ms.execute(ctx, trajectory, epsilon); err != nil {
+		if err := ms.execute(ctx, motionplan.NewSimplePlan(nil, trajectory), epsilon); err != nil {
 			return nil, err
 		}
 		resp[DoExecute] = true
@@ -528,7 +529,34 @@ func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq, logger logging.
 	return plan, err
 }
 
-func (ms *builtIn) execute(ctx context.Context, trajectory motionplan.Trajectory, epsilon float64) error {
+func (ms *builtIn) execute(ctx context.Context, plan motionplan.Plan, epsilon float64) error {
+	// When the plan carries kinodynamic data and the target arm supports the precomputed
+	// trajectory path, send everything in one DoCommand instead of batching GoToInputs.
+	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && len(tgp.Configurations) > 0 {
+		var armName string
+		for name := range tgp.Trajectory()[0] {
+			armName = name
+			break
+		}
+		if armName != "" {
+			if r, ok := ms.components[armName]; ok {
+				const capKey = "supports_execute_traj_gen_plan"
+				capResp, err := r.DoCommand(ctx, map[string]interface{}{capKey: true})
+				if err == nil {
+					if v, _ := capResp[capKey].(bool); v {
+						ms.logger.CInfof(ctx, "executing traj-gen plan on %q (%d samples)", armName, len(tgp.Configurations))
+						_, err = r.DoCommand(ctx, map[string]any{
+							"execute_traj_gen_plan": tgp.DoCommandPayload(),
+						})
+						return err
+					}
+				}
+				ms.logger.CInfof(ctx, "arm %q does not support execute_traj_gen_plan, falling back to GoToInputs", armName)
+			}
+		}
+	}
+
+	trajectory := plan.Trajectory()
 	// Batch GoToInputs calls if possible; components may want to blend between inputs
 	combinedSteps := []map[string][][]referenceframe.Input{}
 	currStep := map[string][][]referenceframe.Input{}
@@ -745,5 +773,23 @@ func (ms *builtIn) writePlanRequest(
 	}
 
 	ms.logger.Infof("writing plan to %s", fn)
-	return req.WriteToFile(fn)
+	if err := req.WriteToFile(fn); err != nil {
+		return err
+	}
+
+	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && ms.trajGen != nil {
+		trajGenFn := strings.TrimSuffix(fn, filepath.Ext(fn)) + "-trajgen.json"
+		ms.logger.Infof("writing traj-gen plan to %s", trajGenFn)
+		data, err := json.Marshal(map[string]any{
+			"settings": ms.trajGen,
+			"plan":     tgp.DoCommandPayload(),
+		})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Clean(trajGenFn), data, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }

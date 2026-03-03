@@ -110,6 +110,8 @@ func NewTrajGen(
 // callers that need velocities, accelerations, or timestamps can type-assert to *TrajGenPlan.
 type TrajGenPlan struct {
 	*motionplan.SimplePlan
+	// Configurations holds per-joint positions at each trajectory sample, parallel to Trajectory().
+	Configurations []*referenceframe.LinearInputs
 	// Velocities holds per-joint velocities at each trajectory sample, parallel to Trajectory().
 	Velocities []*referenceframe.LinearInputs
 	// Accelerations holds per-joint accelerations at each sample. It is nil when the service did
@@ -117,6 +119,26 @@ type TrajGenPlan struct {
 	Accelerations []*referenceframe.LinearInputs
 	// SampleTimes holds the time (in seconds) of each sample, parallel to Trajectory().
 	SampleTimes []float64
+}
+
+// DoCommandPayload returns the map[string]any value for the "execute_traj_gen_plan" do_command key.
+func (t *TrajGenPlan) DoCommandPayload() map[string]any {
+	flatten := func(lis []*referenceframe.LinearInputs) [][]float64 {
+		out := make([][]float64, len(lis))
+		for i, li := range lis {
+			out[i] = li.GetLinearizedInputs()
+		}
+		return out
+	}
+	payload := map[string]any{
+		"configurations_rads":     flatten(t.Configurations),
+		"velocities_rads_per_sec": flatten(t.Velocities),
+		"sample_times_sec":        t.SampleTimes,
+	}
+	if len(t.Accelerations) > 0 {
+		payload["accelerations_rads_per_sec2"] = flatten(t.Accelerations)
+	}
+	return payload
 }
 
 // trajGenResult is the raw output of inferTrajGen.
@@ -301,6 +323,7 @@ func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request
 
 	meta.GoalsProcessed = goalsProcessed
 
+	logger.CInfof(ctx, "sending %d waypoints to traj-gen service", len(trajAsInps))
 	tgResult, err := inferTrajGen(ctx, request.FrameSystem, trajAsInps, trajGen)
 	if err != nil {
 		return nil, meta, err
@@ -308,7 +331,11 @@ func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request
 
 	configs := []*referenceframe.LinearInputs{}
 	if tgResult != nil {
+		logger.CInfof(ctx, "traj-gen service returned %d samples (accelerations present: %v)",
+			len(tgResult.configurations), len(tgResult.accelerations) > 0)
 		configs = tgResult.configurations
+	} else {
+		logger.CInfof(ctx, "traj-gen service indicated arm is already at goal, skipping trajectory")
 	}
 
 	simplePlan, err := motionplan.NewSimplePlanFromTrajectory(configs, request.FrameSystem)
@@ -320,6 +347,7 @@ func PlanMotionTrajGen(ctx context.Context, parentLogger logging.Logger, request
 		SimplePlan: simplePlan,
 	}
 	if tgResult != nil {
+		t.Configurations = tgResult.configurations
 		t.Velocities = tgResult.velocities
 		t.Accelerations = tgResult.accelerations
 		t.SampleTimes = tgResult.sampleTimes
