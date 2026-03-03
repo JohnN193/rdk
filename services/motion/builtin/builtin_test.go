@@ -794,9 +794,13 @@ func TestExecuteTrajGenFastPath(t *testing.T) {
 		SimplePlan: motionplan.NewSimplePlan(nil, motionplan.Trajectory{
 			{"arm": configs},
 		}),
-		Configurations: toLinearInputs(configs),
-		Velocities:     toLinearInputs(vels),
-		SampleTimes:    times,
+		PerComponent: map[string]*armplanning.ComponentTrajGenResult{
+			"arm": {
+				Configurations: toLinearInputs(configs),
+				Velocities:     toLinearInputs(vels),
+				SampleTimes:    times,
+			},
+		},
 	}
 
 	arm := &fakeDoCommandArm{
@@ -846,11 +850,15 @@ func TestExecuteTrajGenCapabilityNotSupported(t *testing.T) {
 		SimplePlan: motionplan.NewSimplePlan(nil, motionplan.Trajectory{
 			{"arm": configs},
 		}),
-		Configurations: []*referenceframe.LinearInputs{
-			referenceframe.FrameSystemInputs{"arm": configs}.ToLinearInputs(),
+		PerComponent: map[string]*armplanning.ComponentTrajGenResult{
+			"arm": {
+				Configurations: []*referenceframe.LinearInputs{
+					referenceframe.FrameSystemInputs{"arm": configs}.ToLinearInputs(),
+				},
+				Velocities:  []*referenceframe.LinearInputs{},
+				SampleTimes: []float64{},
+			},
 		},
-		Velocities:  []*referenceframe.LinearInputs{},
-		SampleTimes: []float64{},
 	}
 
 	arm := &fakeDoCommandArm{

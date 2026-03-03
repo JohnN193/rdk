@@ -78,8 +78,8 @@ func TestTrajGenConfigValidate(t *testing.T) {
 	})
 }
 
-// TestTrajGenPlanDoCommandPayload verifies the serialization format used in execute_traj_gen_plan.
-func TestTrajGenPlanDoCommandPayload(t *testing.T) {
+// TestComponentTrajGenResultDoCommandPayload verifies the serialization format used in execute_traj_gen_plan.
+func TestComponentTrajGenResultDoCommandPayload(t *testing.T) {
 	configs := [][]float64{
 		{0.1, 0.2, 0.3, 0.4, 0.5, 0.6},
 		{0.7, 0.8, 0.9, 1.0, 1.1, 1.2},
@@ -99,14 +99,13 @@ func TestTrajGenPlanDoCommandPayload(t *testing.T) {
 	}
 
 	t.Run("without accelerations", func(t *testing.T) {
-		tgp := &TrajGenPlan{
-			SimplePlan:     motionplan.NewSimplePlan(nil, nil),
+		result := &ComponentTrajGenResult{
 			Configurations: toLinearInputs(configs),
 			Velocities:     toLinearInputs(vels),
 			SampleTimes:    times,
 		}
 
-		payload := tgp.DoCommandPayload()
+		payload := result.DoCommandPayload()
 		test.That(t, payload["configurations_rads"], test.ShouldResemble, configs)
 		test.That(t, payload["velocities_rads_per_sec"], test.ShouldResemble, vels)
 		test.That(t, payload["sample_times_sec"], test.ShouldResemble, times)
@@ -119,15 +118,14 @@ func TestTrajGenPlanDoCommandPayload(t *testing.T) {
 			{0.001, 0.002, 0.003, 0.004, 0.005, 0.006},
 			{0.007, 0.008, 0.009, 0.010, 0.011, 0.012},
 		}
-		tgp := &TrajGenPlan{
-			SimplePlan:     motionplan.NewSimplePlan(nil, nil),
+		result := &ComponentTrajGenResult{
 			Configurations: toLinearInputs(configs),
 			Velocities:     toLinearInputs(vels),
 			Accelerations:  toLinearInputs(accels),
 			SampleTimes:    times,
 		}
 
-		payload := tgp.DoCommandPayload()
+		payload := result.DoCommandPayload()
 		test.That(t, payload["accelerations_rads_per_sec2"], test.ShouldResemble, accels)
 	})
 }
@@ -191,5 +189,5 @@ func TestInferTrajGenEmptyWaypoints(t *testing.T) {
 	result, err := inferTrajGen(context.Background(), nil, nil, nil)
 	test.That(t, err, test.ShouldBeNil)
 	test.That(t, result, test.ShouldNotBeNil)
-	test.That(t, result.configurations, test.ShouldBeEmpty)
+	test.That(t, result.Configurations, test.ShouldBeEmpty)
 }

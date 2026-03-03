@@ -117,24 +117,17 @@ func NewTrajGen(
 	}
 }
 
-// TrajGenPlan is a motionplan.Plan enriched with the kinodynamic data produced by the trajectory
-// generator service. Callers that only need joint configurations can use it as a plain Plan;
-// callers that need velocities, accelerations, or timestamps can type-assert to *TrajGenPlan.
-type TrajGenPlan struct {
-	*motionplan.SimplePlan
-	// Configurations holds per-joint positions at each trajectory sample, parallel to Trajectory().
+// ComponentTrajGenResult holds the kinodynamic data for one component produced by the trajectory
+// generator service.
+type ComponentTrajGenResult struct {
 	Configurations []*referenceframe.LinearInputs
-	// Velocities holds per-joint velocities at each trajectory sample, parallel to Trajectory().
-	Velocities []*referenceframe.LinearInputs
-	// Accelerations holds per-joint accelerations at each sample. It is nil when the service did
-	// not return acceleration data.
-	Accelerations []*referenceframe.LinearInputs
-	// SampleTimes holds the time (in seconds) of each sample, parallel to Trajectory().
-	SampleTimes []float64
+	Velocities     []*referenceframe.LinearInputs
+	Accelerations  []*referenceframe.LinearInputs // nil when not provided by the service
+	SampleTimes    []float64
 }
 
 // DoCommandPayload returns the map[string]any value for the "execute_traj_gen_plan" do_command key.
-func (t *TrajGenPlan) DoCommandPayload() map[string]any {
+func (c *ComponentTrajGenResult) DoCommandPayload() map[string]any {
 	flatten := func(lis []*referenceframe.LinearInputs) [][]float64 {
 		out := make([][]float64, len(lis))
 		for i, li := range lis {
@@ -143,35 +136,37 @@ func (t *TrajGenPlan) DoCommandPayload() map[string]any {
 		return out
 	}
 	payload := map[string]any{
-		"configurations_rads":     flatten(t.Configurations),
-		"velocities_rads_per_sec": flatten(t.Velocities),
-		"sample_times_sec":        t.SampleTimes,
+		"configurations_rads":     flatten(c.Configurations),
+		"velocities_rads_per_sec": flatten(c.Velocities),
+		"sample_times_sec":        c.SampleTimes,
 	}
-	if len(t.Accelerations) > 0 {
-		payload["accelerations_rads_per_sec2"] = flatten(t.Accelerations)
+	if len(c.Accelerations) > 0 {
+		payload["accelerations_rads_per_sec2"] = flatten(c.Accelerations)
 	}
 	return payload
 }
 
-// trajGenResult is the raw output of inferTrajGen.
-type trajGenResult struct {
-	configurations []*referenceframe.LinearInputs
-	velocities     []*referenceframe.LinearInputs
-	accelerations  []*referenceframe.LinearInputs // nil when not provided by the service
-	sampleTimes    []float64
+// TrajGenPlan is a motionplan.Plan enriched with per-component kinodynamic data produced by the
+// trajectory generator service. Callers that only need joint configurations can use it as a plain
+// Plan; callers that need velocities, accelerations, or timestamps can type-assert to *TrajGenPlan
+// and access PerComponent.
+type TrajGenPlan struct {
+	*motionplan.SimplePlan
+	// PerComponent maps each moving component's frame name to its kinodynamic result.
+	PerComponent map[string]*ComponentTrajGenResult
 }
 
 // inferTrajGen sends the waypoints to the trajectory generator service and returns the resulting
-// densely-sampled kinodynamic trajectory. Returns nil when the service indicates the arm is
+// densely-sampled kinodynamic trajectory. Returns nil when the service indicates the component is
 // already at the goal (fewer than 2 distinct waypoints after deduplication).
 func inferTrajGen(
 	ctx context.Context,
 	fs *referenceframe.FrameSystem,
 	trajAsInps []*referenceframe.LinearInputs,
 	tg *TrajGen,
-) (*trajGenResult, error) {
+) (*ComponentTrajGenResult, error) {
 	if len(trajAsInps) == 0 {
-		return &trajGenResult{}, nil
+		return &ComponentTrajGenResult{}, nil
 	}
 
 	schema, err := trajAsInps[0].GetSchema(fs)
@@ -274,14 +269,14 @@ func inferTrajGen(
 
 	times := outMap["sample_times_sec"].Data().([]float64)
 
-	result := &trajGenResult{
-		configurations: configs,
-		velocities:     vels,
-		sampleTimes:    times,
+	result := &ComponentTrajGenResult{
+		Configurations: configs,
+		Velocities:     vels,
+		SampleTimes:    times,
 	}
 
 	if accelTensor, ok := outMap["accelerations_rads_per_sec2"]; ok {
-		result.accelerations, err = linearize(accelTensor)
+		result.Accelerations, err = linearize(accelTensor)
 		if err != nil {
 			return nil, err
 		}
@@ -291,6 +286,7 @@ func inferTrajGen(
 }
 
 // PlanMotionTrajGen plans a motion from a provided plan request using a trajectory generator.
+// Trajectory generation is run independently for each moving component.
 func PlanMotionTrajGen(
 	ctx context.Context, parentLogger logging.Logger, request *PlanRequest, trajGen *TrajGen,
 ) (motionplan.Plan, *PlanMeta, error) {
@@ -309,34 +305,52 @@ func PlanMotionTrajGen(
 		return nil, meta, err
 	}
 
-	logger.CInfof(ctx, "sending %d waypoints to traj-gen service", len(trajAsInps))
-	tgResult, err := inferTrajGen(ctx, request.FrameSystem, trajAsInps, trajGen)
-	if err != nil {
-		return nil, meta, err
+	// Detect which frames are actually moving so we skip static components.
+	traj := make(motionplan.Trajectory, len(trajAsInps))
+	for i, li := range trajAsInps {
+		traj[i] = li.ToFrameSystemInputs()
+	}
+	movingFrames := detectMovingFrames(traj)
+
+	perComponent := make(map[string]*ComponentTrajGenResult)
+	for frameName := range movingFrames {
+		f := request.FrameSystem.Frame(frameName)
+		if f == nil {
+			continue
+		}
+		// Build a single-component FrameSystem so the schema is not inflated to the full DOF.
+		compFs := referenceframe.NewEmptyFrameSystem("")
+		if err := compFs.AddFrame(f, compFs.World()); err != nil {
+			return nil, meta, err
+		}
+		// Extract this component's waypoints from the full frame-system trajectory.
+		compWaypoints := make([]*referenceframe.LinearInputs, len(trajAsInps))
+		for i, fullWp := range trajAsInps {
+			fsInputs := fullWp.ToFrameSystemInputs()
+			compWaypoints[i] = referenceframe.FrameSystemInputs{frameName: fsInputs[frameName]}.ToLinearInputs()
+		}
+		logger.CInfof(ctx, "sending %d waypoints to traj-gen service for component %q", len(compWaypoints), frameName)
+		result, err := inferTrajGen(ctx, compFs, compWaypoints, trajGen)
+		if err != nil {
+			return nil, meta, err
+		}
+		if result != nil && len(result.Configurations) > 0 {
+			logger.CInfof(ctx, "traj-gen returned %d samples for component %q (accelerations: %v)",
+				len(result.Configurations), frameName, len(result.Accelerations) > 0)
+			perComponent[frameName] = result
+		} else {
+			logger.CInfof(ctx, "traj-gen indicated component %q is already at goal", frameName)
+		}
 	}
 
-	configs := []*referenceframe.LinearInputs{}
-	if tgResult != nil {
-		logger.CInfof(ctx, "traj-gen service returned %d samples (accelerations present: %v)",
-			len(tgResult.configurations), len(tgResult.accelerations) > 0)
-		configs = tgResult.configurations
-	} else {
-		logger.CInfof(ctx, "traj-gen service indicated arm is already at goal, skipping trajectory")
-	}
-
-	simplePlan, err := motionplan.NewSimplePlanFromTrajectory(configs, request.FrameSystem)
+	simplePlan, err := motionplan.NewSimplePlanFromTrajectory(trajAsInps, request.FrameSystem)
 	if err != nil {
 		return nil, meta, err
 	}
 
 	t := &TrajGenPlan{
-		SimplePlan: simplePlan,
-	}
-	if tgResult != nil {
-		t.Configurations = tgResult.configurations
-		t.Velocities = tgResult.velocities
-		t.Accelerations = tgResult.accelerations
-		t.SampleTimes = tgResult.sampleTimes
+		SimplePlan:   simplePlan,
+		PerComponent: perComponent,
 	}
 
 	if err := CheckPlanFromRequest(ctx, logger, request, t); err != nil {
