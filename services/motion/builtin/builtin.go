@@ -188,6 +188,7 @@ func (ms *builtIn) Reconfigure(
 	if config.NumThreads > 0 {
 		ms.configuredDefaultExtras["num_threads"] = config.NumThreads
 	}
+	ms.configuredDefaultExtras["skipTrajGen"] = false
 
 	movementSensors := make(map[string]movementsensor.MovementSensor)
 	slamServices := make(map[string]slam.Service)
@@ -501,9 +502,10 @@ func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq, logger logging.
 		PlannerOptions: planOpts,
 	}
 
+	skipTrajGen := req.Extra["skipTrajGen"].(bool)
 	start := time.Now()
 	var plan motionplan.Plan
-	if ms.trajGen != nil {
+	if !skipTrajGen && ms.trajGen != nil {
 		plan, _, err = armplanning.PlanMotionTrajGen(ctx, logger, planRequest, ms.trajGen)
 	} else {
 		plan, _, err = armplanning.PlanMotion(ctx, logger, planRequest)
