@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -503,10 +502,22 @@ func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq, logger logging.
 	}
 
 	skipTrajGen := req.Extra["skipTrajGen"].(bool)
+	trajGen := ms.trajGen
+	if overrideIface, ok := req.Extra["trajectory_generator"]; ok && trajGen != nil {
+		overrideMap, ok := overrideIface.(map[string]any)
+		if !ok {
+			return nil, errors.New("extras trajectory_generator must be a map")
+		}
+		var override armplanning.TrajGenOverride
+		if err := decodeJSONTagged(overrideMap, &override); err != nil {
+			return nil, fmt.Errorf("trajectory_generator override: %w", err)
+		}
+		trajGen = trajGen.WithOverrides(&override)
+	}
 	start := time.Now()
 	var plan motionplan.Plan
-	if !skipTrajGen && ms.trajGen != nil {
-		plan, _, err = armplanning.PlanMotionTrajGen(ctx, logger, planRequest, ms.trajGen)
+	if !skipTrajGen && trajGen != nil {
+		plan, _, err = armplanning.PlanMotionTrajGen(ctx, logger, planRequest, trajGen)
 	} else {
 		plan, _, err = armplanning.PlanMotion(ctx, logger, planRequest)
 	}
@@ -533,60 +544,30 @@ func (ms *builtIn) plan(ctx context.Context, req motion.MoveReq, logger logging.
 }
 
 func (ms *builtIn) execute(ctx context.Context, plan motionplan.Plan, epsilon float64) error {
-	// When the plan carries per-component kinodynamic data, use the traj-gen fast path for each
-	// component that supports it, falling back to GoToInputs per-component otherwise.
-	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && len(tgp.PerComponent) > 0 {
-		names := make([]string, 0, len(tgp.PerComponent))
-		for name := range tgp.PerComponent {
-			names = append(names, name)
+	// When the plan carries kinodynamic data and the target arm supports the precomputed
+	// trajectory path, send everything in one DoCommand instead of batching GoToInputs.
+	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && len(tgp.Configurations) > 0 {
+		var armName string
+		for name := range tgp.Trajectory()[0] {
+			armName = name
+			break
 		}
-		sort.Strings(names)
-
-		for _, componentName := range names {
-			result := tgp.PerComponent[componentName]
-			r, ok := ms.components[componentName]
-			if !ok {
-				return fmt.Errorf("plan had traj-gen result for %q but the motion service is not aware of that component", componentName)
-			}
-
-			capResp, err := r.DoCommand(ctx, map[string]any{armplanning.DoCommandKeySupportsExecuteTrajGenPlan: true})
-			if err == nil {
-				if v, _ := capResp[armplanning.DoCommandKeySupportsExecuteTrajGenPlan].(bool); v {
-					ms.logger.CInfof(ctx, "executing traj-gen plan on %q (%d samples)", componentName, len(result.Configurations))
-					if _, err := r.DoCommand(ctx, map[string]any{
-						armplanning.DoCommandKeyExecuteTrajGenPlan: result.DoCommandPayload(),
-					}); err != nil {
+		if armName != "" {
+			if r, ok := ms.components[armName]; ok {
+				capResp, err := r.DoCommand(ctx, map[string]any{armplanning.DoCommandKeySupportsExecuteTrajGenPlan: true})
+				if err == nil {
+					if v, _ := capResp[armplanning.DoCommandKeySupportsExecuteTrajGenPlan].(bool); v {
+						ms.logger.CInfof(ctx, "executing traj-gen plan on %q (%d samples)", armName, len(tgp.Configurations))
+						_, err = r.DoCommand(ctx, map[string]any{
+							armplanning.DoCommandKeyExecuteTrajGenPlan: tgp.DoCommandPayload(),
+						})
 						return err
 					}
-					continue
 				}
-			}
-
-			// Fall back to GoToInputs for this component.
-			ms.logger.CInfof(ctx, "component %q does not support %s, falling back to GoToInputs",
-				componentName, armplanning.DoCommandKeyExecuteTrajGenPlan)
-			ie, err := utils.AssertType[framesystem.InputEnabled](r)
-			if err != nil {
-				return err
-			}
-			var componentInputs [][]referenceframe.Input
-			for _, step := range tgp.Trajectory() {
-				if inputs, ok := step[componentName]; ok && len(inputs) > 0 {
-					componentInputs = append(componentInputs, inputs)
-				}
-			}
-			if len(componentInputs) > 0 {
-				if err := ie.GoToInputs(ctx, componentInputs...); err != nil {
-					if actuator, ok := r.(inputEnabledActuator); ok {
-						if stopErr := actuator.Stop(ctx, nil); stopErr != nil {
-							return errors.Wrap(err, stopErr.Error())
-						}
-					}
-					return err
-				}
+				ms.logger.CInfof(ctx, "arm %q does not support %s, falling back to GoToInputs",
+					armName, armplanning.DoCommandKeyExecuteTrajGenPlan)
 			}
 		}
-		return nil
 	}
 
 	trajectory := plan.Trajectory()
@@ -764,6 +745,16 @@ func waypointsFromRequest(
 	return startState, waypoints, nil
 }
 
+// decodeJSONTagged decodes a map[string]any into a struct by round-tripping
+// through JSON, so that json struct tags are honoured.
+func decodeJSONTagged(m map[string]any, dst any) error {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, dst)
+}
+
 func (ms *builtIn) writePlanRequest(
 	req *armplanning.PlanRequest, plan motionplan.Plan, start time.Time, traceID, planTag string, planError error,
 ) error {
@@ -810,16 +801,12 @@ func (ms *builtIn) writePlanRequest(
 		return err
 	}
 
-	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && ms.trajGen != nil && len(tgp.PerComponent) > 0 {
+	if tgp, ok := plan.(*armplanning.TrajGenPlan); ok && ms.trajGen != nil {
 		trajGenFn := strings.TrimSuffix(fn, filepath.Ext(fn)) + "-trajgen.json"
 		ms.logger.Infof("writing traj-gen plan to %s", trajGenFn)
-		perComponentPayloads := make(map[string]any, len(tgp.PerComponent))
-		for name, result := range tgp.PerComponent {
-			perComponentPayloads[name] = result.DoCommandPayload()
-		}
 		data, err := json.Marshal(map[string]any{
-			"settings":      ms.trajGen,
-			"per_component": perComponentPayloads,
+			"settings": ms.trajGen,
+			"plan":     tgp.DoCommandPayload(),
 		})
 		if err != nil {
 			return err

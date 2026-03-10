@@ -791,16 +791,10 @@ func TestExecuteTrajGenFastPath(t *testing.T) {
 	}
 
 	tgp := &armplanning.TrajGenPlan{
-		SimplePlan: motionplan.NewSimplePlan(nil, motionplan.Trajectory{
-			{"arm": configs},
-		}),
-		PerComponent: map[string]*armplanning.ComponentTrajGenResult{
-			"arm": {
-				Configurations: toLinearInputs(configs),
-				Velocities:     toLinearInputs(vels),
-				SampleTimes:    times,
-			},
-		},
+		SimplePlan:     motionplan.NewSimplePlan(nil, motionplan.Trajectory{{"arm": configs}}),
+		Configurations: toLinearInputs(configs),
+		Velocities:     toLinearInputs(vels),
+		SampleTimes:    times,
 	}
 
 	arm := &fakeDoCommandArm{
@@ -847,18 +841,12 @@ func TestExecuteTrajGenCapabilityNotSupported(t *testing.T) {
 	configs := []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6}
 
 	tgp := &armplanning.TrajGenPlan{
-		SimplePlan: motionplan.NewSimplePlan(nil, motionplan.Trajectory{
-			{"arm": configs},
-		}),
-		PerComponent: map[string]*armplanning.ComponentTrajGenResult{
-			"arm": {
-				Configurations: []*referenceframe.LinearInputs{
-					referenceframe.FrameSystemInputs{"arm": configs}.ToLinearInputs(),
-				},
-				Velocities:  []*referenceframe.LinearInputs{},
-				SampleTimes: []float64{},
-			},
+		SimplePlan: motionplan.NewSimplePlan(nil, motionplan.Trajectory{{"arm": configs}}),
+		Configurations: []*referenceframe.LinearInputs{
+			referenceframe.FrameSystemInputs{"arm": configs}.ToLinearInputs(),
 		},
+		Velocities:  []*referenceframe.LinearInputs{},
+		SampleTimes: []float64{},
 	}
 
 	arm := &fakeDoCommandArm{
